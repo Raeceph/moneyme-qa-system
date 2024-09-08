@@ -1,6 +1,7 @@
 from typing import List, Dict
 from collections import deque
 import time
+import asyncio
 
 
 class ConversationManager:
@@ -44,12 +45,3 @@ class ConversationManager:
             role = "Human" if message["role"] == "user" else "AI"
             summary.append(f"{role}: {message['content']}")
         return "\n".join(summary)
-
-    def prune_old_conversations(self, max_age: float = 3600):
-        """Remove conversations that have messages older than the specified max age.- good to haev functions"""
-        current_time = time.time()
-        for session_id in list(self.conversations.keys()):
-            if self.conversations[session_id]:
-                oldest_message = self.conversations[session_id][0]
-                if current_time - oldest_message["timestamp"] > max_age:
-                    del self.conversations[session_id]

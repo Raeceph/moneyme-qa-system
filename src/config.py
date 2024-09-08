@@ -4,7 +4,10 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+
 class Config:
+    """Configuration class for the QA system."""
+
     # General LLM provider configuration
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
 
@@ -23,8 +26,8 @@ class Config:
     EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "paraphrase-MiniLM-L6-v2")
 
     # Vector store configuration
-    VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "/app/vector_store")
-    UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY", "/app/uploads")
+    VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "./vector_store/faiss_index")
+    UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY", "./uploads")
 
     # New configuration options
     CHAIN_OF_THOUGHTS_ENABLED = (
@@ -37,10 +40,10 @@ class Config:
         else []
     )
 
-    UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY", "/app/uploads")
-
-    def __init__(self):
-        pass
 
 # Create a global instance of the Config class
 config = Config()
+
+# Create necessary directories
+os.makedirs(config.VECTOR_STORE_PATH, exist_ok=True)
+os.makedirs(config.UPLOAD_DIRECTORY, exist_ok=True)

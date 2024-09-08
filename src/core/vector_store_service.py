@@ -1,18 +1,25 @@
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
+from cachetools import TTLCache, cached
 from typing import List, Dict, Any
 from src.config import Config
 import warnings
 import logging
 import json
 import os
+import asyncio
 
-logger = logging.getLogger(__name__)
+import structlog
+from src.utils.logging_configs import configure_logging
+
+configure_logging()
+logger = structlog.get_logger(__name__)
 
 # Suppress the LangChainDeprecationWarning and huggingface warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 
 class VectorStoreService:
     """Service for managing the creation, loading, and querying of the vector store."""
@@ -22,21 +29,22 @@ class VectorStoreService:
         self.config = config
         self.embeddings = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
         self.vector_store = None
+        self.query_cache = TTLCache(maxsize=100, ttl=3600)
 
-    def vector_store_exists(self, path: str) -> bool:
+    async def vector_store_exists(self, path: str) -> bool:
         """Check if the vector store files exist at the given path."""
         index_file = os.path.join(path, "index.faiss")
         pkl_file = os.path.join(path, "index.pkl")
         return os.path.exists(index_file) and os.path.exists(pkl_file)
 
-    def is_loaded(self) -> bool:
+    async def is_loaded(self) -> bool:
         """Check if the vector store is loaded."""
         return (
             self.vector_store is not None
             and len(self.vector_store.index_to_docstore_id) > 0
         )
 
-    def create_vector_store(self, chunks_with_metadata: List[Dict[str, Any]]):
+    async def create_vector_store(self, chunks_with_metadata: List[Dict[str, Any]]):
         """Creates a vector store from a list of text chunks with metadata."""
         documents = []
         for chunk in chunks_with_metadata:
@@ -53,50 +61,63 @@ class VectorStoreService:
                         metadata={
                             "type": "table",
                             "headers": metadata.get("headers", []),
-                            "years": metadata.get("years", []),
                         },
                     )
                 else:
-                    logger.warning(f"Unknown chunk type: {metadata.get('type')}")
+                    logger.warning(
+                        "Unknown chunk type", chunk_type=metadata.get("type")
+                    )
                     continue
                 documents.append(doc)
             except Exception as e:
-                logger.error(f"Error processing chunk: {e}")
-                logger.error(f"Problematic chunk: {chunk}")
+                logger.error("Error processing chunk", error=str(e), chunk=chunk)
 
         if not documents:
             raise ValueError("No valid documents to create vector store")
 
-        self.vector_store = FAISS.from_documents(documents, self.embeddings)
-        logger.info(f"Created vector store with {len(documents)} documents")
+        self.vector_store = await FAISS.afrom_documents(documents, self.embeddings)
+        logger.info("Created vector store", document_count=len(documents))
 
-    def save_vector_store(self, path: str):
+    async def save_vector_store(self, path: str):
         """Saves the vector store to the specified local path."""
         if self.vector_store is None:
             raise ValueError("Vector store has not been created yet.")
         os.makedirs(path, exist_ok=True)
-        self.vector_store.save_local(path)
-        logger.info(f"Vector store saved to {path}")
+        await asyncio.to_thread(self.vector_store.save_local, path)
+        logger.info("Vector store saved", path=path)
 
-    def load_vector_store(self, path: str):
+    async def load_vector_store(self, path: str):
         """Loads the vector store from the specified local path."""
         try:
-            if not self.vector_store_exists(path):
+            # Check if the vector store exists before trying to load it
+            if not await self.vector_store_exists(path):
                 raise FileNotFoundError(f"No vector store found at {path}")
-            self.vector_store = FAISS.load_local(
-                path, self.embeddings, allow_dangerous_deserialization=True
+
+            # Use asyncio.to_thread to call the synchronous FAISS load_local method asynchronously
+            self.vector_store = await asyncio.to_thread(
+                FAISS.load_local,
+                path,
+                self.embeddings,
+                allow_dangerous_deserialization=True,
             )
-            logger.info(f"Vector store loaded successfully from {path}")
+
+            logger.info("Vector store loaded successfully", path=path)
         except Exception as e:
-            logger.error(f"Error loading vector store: {str(e)}")
+            logger.error("Error loading vector store", error=str(e))
             raise
 
-    def query(self, query_text: str) -> str:
+    async def query(self, query_text: str) -> str:
         """Queries the vector store with a text input and returns the results."""
+        if query_text in self.query_cache:
+            logger.info("Query result found in cache", query_text=query_text)
+            return self.query_cache[query_text]
+
         if self.vector_store is None:
+            logger.error("Vector store not created or loaded")
             raise ValueError("Vector store has not been created or loaded yet.")
 
-        results = self.vector_store.similarity_search(query_text, k=3)
+        logger.info("Querying vector store", query_text=query_text)
+        results = await self.vector_store.asimilarity_search(query_text, k=3)
         processed_results = []
 
         for doc in results:
@@ -122,37 +143,33 @@ class VectorStoreService:
                         }
                     )
                 else:
-                    logger.warning(f"Unknown document type: {doc.metadata.get('type')}")
+                    logger.warning(
+                        "Unknown document type", doc_type=doc.metadata.get("type")
+                    )
                     processed_results.append(
                         {"type": "unknown", "content": doc.page_content}
                     )
             except json.JSONDecodeError:
-                logger.error(f"Failed to parse JSON for document: {doc.metadata}")
+                logger.error("Failed to parse JSON for document", metadata=doc.metadata)
             except Exception as e:
-                logger.error(f"Error processing document: {str(e)}")
+                logger.error("Error processing document", error=str(e))
 
-        logger.debug(f"Processed query results: {processed_results}")
+        # Cache the query results
+        self.query_cache[query_text] = json.dumps(processed_results)
+
+        logger.debug("Processed query results", results=processed_results)
         return json.dumps(processed_results)
 
-    def get_all_documents(self) -> List[str]:
-        """Retrieves all documents stored in the vector store."""
-        if self.vector_store is None:
-            raise ValueError("Vector store has not been created or loaded yet.")
-
-        # Return the list of file paths of all documents in the vector store
-        documents = self.vector_store.get_all_documents()
-        return [doc.metadata.get("file_path", "unknown") for doc in documents]
-
-    def load_or_create_vector_store(self, pdf_path: str):
+    async def load_or_create_vector_store(self, pdf_path: str):
         """Loads or creates a vector store from the PDF located at the given path."""
         vector_store_path = self.config.VECTOR_STORE_PATH
-        if self.vector_store_exists(vector_store_path):
-            self.load_vector_store(vector_store_path)
+        if await self.vector_store_exists(vector_store_path):
+            await self.load_vector_store(vector_store_path)
         else:
             from src.core.pdf_parser import PDFParser
 
             pdf_parser = PDFParser(pdf_path)
-            sections_with_metadata = pdf_parser.extract_sections_with_metadata()
-            self.create_vector_store(sections_with_metadata)
-            self.save_vector_store(vector_store_path)
-        logger.info(f"Vector store loaded or created for {pdf_path}")
+            sections_with_metadata = await pdf_parser.extract_sections_with_metadata()
+            await self.create_vector_store(sections_with_metadata)
+            await self.save_vector_store(vector_store_path)
+        logger.info("Vector store loaded or created", pdf_path=pdf_path)

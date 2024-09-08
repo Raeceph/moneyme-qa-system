@@ -1,11 +1,12 @@
 # src/llm_providers/ollama_provider.py
 
 from langchain_community.llms import Ollama
-import logging
+import structlog
 from src.config import Config
 from src.llm_providers.llm_provider_base import LLMProviderBase
+import asyncio
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class OllamaProvider(LLMProviderBase):
@@ -18,25 +19,23 @@ class OllamaProvider(LLMProviderBase):
         self.base_url = config.OLLAMA_BASE_URL
 
         logger.info(
-            f"Initializing Ollama with model: {self.model_name}, base_url: {self.base_url}"
+            "Initializing Ollama", model=self.model_name, base_url=self.base_url
         )
 
         self.llm = Ollama(model=self.model_name, base_url=self.base_url)
 
-    def generate_response(self, prompt: str) -> str:
+    async def generate_response(self, prompt: str) -> str:
         """Sends a prompt to the Ollama model and returns the generated response."""
-        logger.info(
-            f"Sending prompt to Ollama: {prompt[:100]}..."
-        )  # Log first 100 characters of prompt
+        logger.info("Sending prompt to Ollama", prompt_preview=prompt[:100])
 
         try:
-            response = self.llm.invoke(prompt)
+            response = await asyncio.to_thread(self.llm.invoke, prompt)
             logger.info(
-                f"Received response from Ollama: {response[:100]}..."
-            )  # Log first 100 characters of response
+                "Received response from Ollama", response_preview=response[:100]
+            )
             return response.strip()
         except Exception as e:
-            logger.error(f"Error generating response from Ollama: {str(e)}")
+            logger.error("Error generating response from Ollama", error=str(e))
             return f"Error generating response: {str(e)}"
 
     def get_model_name(self) -> str:

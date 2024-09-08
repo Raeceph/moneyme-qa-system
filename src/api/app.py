@@ -10,6 +10,7 @@ import os
 import uuid
 import logging
 import tempfile
+import asyncio
 
 
 """Create a FastAPI instance for the MONEYME AI Q&A API."""
@@ -85,14 +86,13 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the vector store on startup if it exists, loading the last processed PDF."""
     try:
         vector_store_path = config.VECTOR_STORE_PATH
         logger.info(f"Checking for vector store at path: {vector_store_path}")
 
-        if qa_system.vector_store_service.vector_store_exists(vector_store_path):
-            qa_system.vector_store_service.load_vector_store(vector_store_path)
-            last_pdf = qa_system.get_last_pdf()
+        if await qa_system.vector_store_service.vector_store_exists(vector_store_path):
+            await qa_system.vector_store_service.load_vector_store(vector_store_path)
+            last_pdf = await qa_system.get_last_pdf()
             logger.info(f"Vector store loaded. Last processed PDF: {last_pdf}")
             print(f"Vector store loaded. Last processed PDF: {last_pdf}")
         else:
@@ -111,16 +111,14 @@ async def startup_event():
     responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 async def query(request: QueryRequest):
-    """Process a single query request and return the answer, source, and quality score."""
     try:
-        # Check if vector store exists
-        if not qa_system.vector_store_service.is_loaded():
+        if not await qa_system.vector_store_service.is_loaded():
             raise HTTPException(
                 status_code=400,
                 detail="No PDF has been processed yet. Please upload a PDF first.",
             )
 
-        result = qa_system.process_single_query(request.question)
+        result = await qa_system.process_single_query(request.question)
         return QueryResponse(
             answer=result["answer"],
             source=result["source"],
@@ -132,11 +130,9 @@ async def query(request: QueryRequest):
         logger.error(f"QASystemError in query: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Unexpected error in query: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="An internal server error occurred. Please try again later.",
-        )
+        logger.exception("Unexpected error in query", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred")
 
 
 @app.post(
@@ -145,16 +141,16 @@ async def query(request: QueryRequest):
     responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 async def chat(request: ChatRequest):
-    """Process a chat query and return the session ID, answer, source, quality score, and conversation history."""
     try:
-        # Check if vector store exists
-        if not qa_system.vector_store_service.is_loaded():
+        if not await qa_system.vector_store_service.is_loaded():
             raise HTTPException(
                 status_code=400,
                 detail="No PDF has been processed yet. Please upload a PDF first.",
             )
 
-        result = qa_system.process_chat_query(request.session_id, request.question)
+        result = await qa_system.process_chat_query(
+            request.session_id, request.question
+        )
         return ChatResponse(
             session_id=result["session_id"],
             answer=result["answer"],
@@ -168,11 +164,9 @@ async def chat(request: ChatRequest):
         logger.error(f"QASystemError in chat: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Unexpected error in chat: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="An internal server error occurred. Please try again later.",
-        )
+        logger.exception("Unexpected error in chat", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred")
 
 
 @app.post(
@@ -184,29 +178,31 @@ async def chat(request: ChatRequest):
     },
 )
 async def upload_pdf(file: UploadFile = File(...)):
-    """Upload and process a PDF file, adding it to the vector store."""
     try:
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail="Uploaded file must be a PDF")
 
-        # Create uploads directory if it doesn't exist
         os.makedirs(config.UPLOAD_DIRECTORY, exist_ok=True)
-
         file_path = os.path.join(config.UPLOAD_DIRECTORY, file.filename)
 
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
 
-        qa_system.load_or_create_vector_store(file_path, file.filename)
+        task = asyncio.create_task(
+            qa_system.load_or_create_vector_store(file_path, file.filename)
+        )
+
         return {
-            "message": f"PDF processed and added to the vector store: {file.filename}"
+            "message": f"PDF upload started. Processing in background: {file.filename}"
         }
 
     except QASystemError as e:
+        logger.error(f"QASystemError in upload_pdf: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error processing PDF: {str(e)}")
+        logger.exception("Error processing PDF", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
         raise HTTPException(status_code=500, detail="Error processing PDF")
 
 
@@ -214,62 +210,15 @@ async def upload_pdf(file: UploadFile = File(...)):
     "/list_documents", responses={200: {"model": dict}, 500: {"model": ErrorResponse}}
 )
 async def list_documents():
-    """List all processed documents from the vector store."""
     try:
-        documents = qa_system.list_documents()
+        documents = await qa_system.list_documents()
         return {"documents": documents}
     except Exception as e:
-        logger.error(f"Error listing documents: {str(e)}")
+        logger.exception("Error listing documents", exc_info=True)
+        logger.error(f"Error details: {str(e)}")
         raise HTTPException(status_code=500, detail="Error listing documents")
-
-
-@app.post(
-    "/clear_chat",
-    responses={
-        200: {"model": dict},
-        400: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-    },
-)
-async def clear_chat(
-    x_session_id: str = Header(..., description="Session ID to clear")
-):
-    """Clear conversation history for the specified session ID."""
-    try:
-        qa_system.clear_conversation(x_session_id)
-        return {"message": f"Conversation cleared for session {x_session_id}"}
-    except QASystemError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error clearing chat: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error clearing chat")
-
-
-@app.get(
-    "/session_info",
-    responses={
-        200: {"model": dict},
-        400: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-    },
-)
-async def get_session_info(
-    x_session_id: str = Header(..., description="Session ID to get info for")
-):
-    """Retrieve session information for the specified session ID."""
-    try:
-        info = qa_system.get_session_info(x_session_id)
-        if info is None:
-            raise HTTPException(status_code=400, detail="Session not found")
-        return info
-    except QASystemError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error getting session info: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error getting session info")
 
 
 @app.get("/", responses={200: {"model": dict}})
 async def root():
-    """Return a welcome message for the MONEYME AI Q&A API."""
     return {"message": "Welcome to the MONEYME AI Q&A API"}

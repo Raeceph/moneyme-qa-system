@@ -1,5 +1,7 @@
 import logging
 from functools import wraps
+import functools
+import aiofiles
 
 logger = logging.getLogger(__name__)
 
@@ -10,8 +12,8 @@ class QASystemError(Exception):
     pass
 
 
-class InvalidSessionError(QASystemError):
-    """Raised when an invalid session is encountered."""
+class VectorStoreError(QASystemError):
+    """Raised when there's an error with vector store operations."""
 
     pass
 
@@ -22,40 +24,51 @@ class DocumentProcessingError(QASystemError):
     pass
 
 
-class VectorStoreError(QASystemError):
-    """Raised when there's an error with the vector store operations."""
+class LLMError(QASystemError):
+    """Raised when there's an error with the Language Model."""
 
     pass
 
 
-class LLMProviderError(QASystemError):
-    """Raised when there's an error with the LLM provider."""
+class InvalidInputError(QASystemError):
+    """Raised when the input to a function is invalid."""
 
     pass
+
+
+class ConfigurationError(QASystemError):
+    """Raised when there's an error in the system configuration."""
+
+    pass
+
+
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 def handle_errors(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
         try:
-            return func(*args, **kwargs)
-        except InvalidSessionError as e:
-            logger.error(f"Invalid session error in {func.__name__}: {str(e)}")
-            return {"error": str(e), "type": "InvalidSessionError"}
-        except DocumentProcessingError as e:
-            logger.error(f"Document processing error in {func.__name__}: {str(e)}")
-            return {"error": str(e), "type": "DocumentProcessingError"}
+            return await func(*args, **kwargs)
         except VectorStoreError as e:
-            logger.error(f"Vector store error in {func.__name__}: {str(e)}")
-            return {"error": str(e), "type": "VectorStoreError"}
-        except LLMProviderError as e:
-            logger.error(f"LLM provider error in {func.__name__}: {str(e)}")
-            return {"error": str(e), "type": "LLMProviderError"}
+            logger.error("Vector store error", error_message=str(e))
+            raise
+        except DocumentProcessingError as e:
+            logger.error("Document processing error", error_message=str(e))
+            raise
+        except LLMError as e:
+            logger.error("Language Model error", error_message=str(e))
+            raise
+        except InvalidInputError as e:
+            logger.error("Invalid input error", error_message=str(e))
+            raise
+        except ConfigurationError as e:
+            logger.error("Configuration error", error_message=str(e))
+            raise
         except Exception as e:
-            logger.error(f"Unexpected error in {func.__name__}: {str(e)}")
-            return {
-                "error": f"An unexpected error occurred: {str(e)}",
-                "type": "UnexpectedError",
-            }
+            logger.exception("Unexpected error", error_message=str(e))
+            raise QASystemError(f"An unexpected error occurred: {str(e)}")
 
     return wrapper

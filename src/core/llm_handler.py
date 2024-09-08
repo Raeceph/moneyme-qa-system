@@ -6,8 +6,13 @@ from src.core.conversation_manager import ConversationManager
 from src.utils.error_handler import handle_errors
 from textstat import flesch_reading_ease
 import json
+import structlog
+from src.utils.logging_configs import configure_logging
+import asyncio
+from src.llm_providers.ollama_provider import OllamaProvider
 
-logger = logging.getLogger(__name__)
+configure_logging()
+logger = structlog.get_logger(__name__)
 
 
 class LLMHandler:
@@ -18,21 +23,24 @@ class LLMHandler:
         self.config = config
         self.llm_provider = llm_provider or LLMFactory.get_provider(config)
         self.conversation_manager = conversation_manager or ConversationManager()
+        self.ollama_provider = OllamaProvider(config)  #
 
     @handle_errors
-    def generate_response(
+    async def generate_response(
         self, session_id: str, context: str, question: str
     ) -> Dict[str, str]:
         """Generates a response from the LLM based on context, question, and conversation history."""
         try:
+            # Parse the context JSON and format the context for the LLM
             context_data = json.loads(context)
             formatted_context = self._format_context(context_data)
 
+            # Get the conversation history summary for the session (this is a synchronous call)
             conversation_history = self.conversation_manager.get_conversation_summary(
                 session_id
             )
 
-            # Create the initial prompt
+            # Create the initial prompt for the LLM
             prompt = self._create_prompt(
                 formatted_context, question, conversation_history
             )
@@ -41,22 +49,25 @@ class LLMHandler:
             if self.config.CHAIN_OF_THOUGHTS_ENABLED:
                 prompt = self._add_chain_of_thoughts(prompt)
 
-            # If example prompts are provided, add them to the prompt
+            # If example prompts are provided, append them to the prompt
             if self.config.EXAMPLE_PROMPTS:
                 prompt += "\n\nExamples:\n"
                 prompt += "\n".join(self.config.EXAMPLE_PROMPTS)
 
+            # Generate a response from the LLM
             try:
-                response = self.llm_provider.generate_response(prompt)
+                response = await self.ollama_provider.generate_response(prompt)
             except Exception as e:
                 logger.error(
                     f"Failed to generate response from provider {self.llm_provider.get_provider_name()}: {e}"
                 )
                 return {"error": f"Failed to generate response: {e}"}
 
+            # Add the user question and LLM response to the conversation history (sync call)
             self.conversation_manager.add_message(session_id, "user", question)
             self.conversation_manager.add_message(session_id, "assistant", response)
 
+            # Evaluate the quality of the generated response
             quality_score = self._evaluate_answer_quality(response)
 
             return {
@@ -64,6 +75,7 @@ class LLMHandler:
                 "source": self.llm_provider.__class__.__name__,
                 "quality_score": quality_score,
             }
+
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse context JSON: {e}")
             raise
@@ -87,19 +99,29 @@ class LLMHandler:
         Assistant: Let me analyze the context and conversation history to provide an accurate answer.
         """
 
-    def _add_chain_of_thoughts(self, prompt: str) -> str:
-        """
-        Adds a chain of thoughts to the prompt to guide the model's reasoning.
-        """
-        chain_of_thoughts_text = "\n".join(self.config.CHAIN_OF_THOUGHTS_PROMPT)
+    def _create_prompt(
+        self, context: str, question: str, conversation_history: str
+    ) -> str:
+        """Creates a prompt using context, question, conversation history, and example prompts."""
 
-        return f"""
-        {prompt}
+        # Start with the basic prompt that includes context, question, and conversation history
+        prompt = f"""
+        Context: {context}
 
-        Let's approach this step by step:
+        Conversation History:
+        {conversation_history}
 
-        {chain_of_thoughts_text}
+        Human: {question}
+
+        Assistant: Let me analyze the context and conversation history to provide an accurate answer.
         """
+
+        # If example prompts are configured, append them
+        if self.config.EXAMPLE_PROMPTS:
+            prompt += "\n\nExamples:\n"
+            prompt += "\n".join(self.config.EXAMPLE_PROMPTS)
+
+        return prompt
 
     def _format_context(self, context_data):
         """Formats context data into readable sections of text."""
@@ -110,7 +132,12 @@ class LLMHandler:
                     f"Header: {item['header']}\nContent: {item['content']}\n\n"
                 )
             elif item["type"] == "table":
-                formatted_context += f"Table:\nHeaders: {', '.join(item['headers'])}\n"
+                # Ensure that all headers are strings, replace None with empty strings if necessary
+                headers = [
+                    str(header) if header is not None else ""
+                    for header in item.get("headers", [])
+                ]
+                formatted_context += f"Table:\nHeaders: {', '.join(headers)}\n"
                 for row in item["data"]:
                     formatted_context += f"{', '.join(map(str, row))}\n"
                 formatted_context += "\n"
